@@ -7,17 +7,20 @@ set -euo pipefail
 # Requirements:
 #   - Claude Code CLI installed and authenticated (https://claude.ai/claude-code)
 #   - python3 (for JSON parsing)
-#   - bash 4+
+#   - bash 3.2+ (macOS default) or bash 4+ (Linux)
+#   - timeout (coreutils) or gtimeout (macOS: brew install coreutils)
 #
 # Configuration (environment variables):
 #   DISPATCH_PROJECTS_DIR  — where projects live (default: ~/dispatch-projects)
 #   DISPATCH_CC_BIN        — path to claude CLI (default: auto-detect)
 #   DISPATCH_TIMEOUT       — default timeout in seconds (default: 600)
-#   DISPATCH_PERMISSION    — CC permission mode (default: not set, uses CC's default)
-#                            Set to "dangerously-skip-permissions" for fully autonomous execution
-#                            in trusted/sandboxed environments.
+#   DISPATCH_PERMISSION    — CC permission mode (default: acceptEdits)
+#                            Options: acceptEdits, plan, dangerously-skip-permissions
+#                            Note: headless mode (-p) requires a permission mode that doesn't
+#                            prompt interactively. "acceptEdits" auto-approves file edits;
+#                            "dangerously-skip-permissions" auto-approves everything.
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly PROJECTS_DIR="${DISPATCH_PROJECTS_DIR:-$HOME/dispatch-projects}"
 readonly DEFAULT_TIMEOUT="${DISPATCH_TIMEOUT:-600}"
 readonly DEFAULT_MAX_TURNS=0
@@ -33,7 +36,19 @@ detect_cc_bin() {
   fi
 }
 
+# Auto-detect timeout command (GNU timeout or gtimeout on macOS)
+detect_timeout_bin() {
+  if command -v timeout &>/dev/null; then
+    echo "timeout"
+  elif command -v gtimeout &>/dev/null; then
+    echo "gtimeout"
+  else
+    echo ""
+  fi
+}
+
 CC_BIN="$(detect_cc_bin)"
+TIMEOUT_BIN="$(detect_timeout_bin)"
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -44,16 +59,28 @@ require_cc() {
   [[ -n "$CC_BIN" && -x "$CC_BIN" ]] || die "Claude Code CLI not found. Install: https://claude.ai/claude-code"
 }
 
+require_timeout() {
+  if [[ -z "$TIMEOUT_BIN" ]]; then
+    die "timeout command not found. On macOS: brew install coreutils (provides gtimeout)"
+  fi
+}
+
 validate_slug() {
   local slug="$1"
-  if [[ -z "$slug" || "$slug" == *..* || "$slug" == /* || "$slug" == */* || "$slug" =~ [^a-zA-Z0-9._-] ]]; then
+  if [[ -z "$slug" ]] || [[ "$slug" == *..* ]] || [[ "$slug" == /* ]] || [[ "$slug" == */* ]]; then
     die "Invalid slug: '$slug' (use lowercase alphanumeric with hyphens, e.g. 'my-project')"
   fi
+  # Check for valid characters (compatible with bash 3.2)
+  case "$slug" in
+    *[!a-zA-Z0-9._-]*) die "Invalid slug: '$slug' (use lowercase alphanumeric with hyphens, e.g. 'my-project')" ;;
+  esac
 }
 
 validate_number() {
   local val="$1" name="$2"
-  [[ "$val" =~ ^[0-9]+$ ]] || die "$name must be a number, got: '$val'"
+  case "$val" in
+    ''|*[!0-9]*) die "$name must be a number, got: '$val'" ;;
+  esac
 }
 
 lock_dir_for_slug() {
@@ -89,10 +116,8 @@ release_lock() {
 file_mtime() {
   local file="$1"
   if stat --version &>/dev/null 2>&1; then
-    # GNU stat (Linux)
     date -r "$file" '+%m-%d %H:%M' 2>/dev/null || echo ""
   else
-    # BSD stat (macOS)
     stat -f '%Sm' -t '%m-%d %H:%M' "$file" 2>/dev/null || echo ""
   fi
 }
@@ -135,8 +160,8 @@ Environment:
   DISPATCH_PROJECTS_DIR  Project root (default: ~/dispatch-projects)
   DISPATCH_CC_BIN        Claude CLI path (default: auto-detect)
   DISPATCH_TIMEOUT       Default timeout (default: 600)
-  DISPATCH_PERMISSION    Permission mode (default: CC's default interactive mode)
-                         Set "dangerously-skip-permissions" for autonomous execution
+  DISPATCH_PERMISSION    Permission mode (default: acceptEdits)
+                         Options: acceptEdits, plan, dangerously-skip-permissions
 
 Iterative workflow:
   dispatch-cc run    --slug my-task --prompt "build X" --max-turns 20
@@ -165,11 +190,11 @@ run_cc() {
   cmd+=(--print)
   cmd+=(--output-format json)
 
-  # Permission mode — only add if explicitly configured
-  local perm="${DISPATCH_PERMISSION:-}"
+  # Permission mode — default to acceptEdits for headless operation
+  local perm="${DISPATCH_PERMISSION:-acceptEdits}"
   if [[ "$perm" == "dangerously-skip-permissions" ]]; then
     cmd+=(--dangerously-skip-permissions)
-  elif [[ -n "$perm" ]]; then
+  else
     cmd+=(--permission-mode "$perm")
   fi
 
@@ -182,19 +207,21 @@ run_cc() {
 
   [[ -n "$model" ]] && cmd+=(--model "$model")
   [[ -n "$allowed_tools" ]] && cmd+=(--allowedTools "$allowed_tools")
-  [[ "$max_turns" -gt 0 ]] 2>/dev/null && cmd+=(--max-turns "$max_turns")
+  if [[ "$max_turns" -gt 0 ]] 2>/dev/null; then
+    cmd+=(--max-turns "$max_turns")
+  fi
   [[ -n "$system_prompt" ]] && cmd+=(--append-system-prompt "$system_prompt")
 
   log "Project: $project_dir"
   log "Session: $session_name"
   log "Timeout: ${timeout}s | Max turns: ${max_turns:-unlimited}"
-  log "Model: ${model:-default}"
+  log "Model: ${model:-default} | Permission: $perm"
 
   # Execute from project directory
   local exit_code=0
   (
     cd "$project_dir"
-    timeout "$timeout" "${cmd[@]}"
+    "$TIMEOUT_BIN" "$timeout" "${cmd[@]}"
   ) > "$log_file" 2>"$stderr_log" || exit_code=$?
 
   # CC may output JSON to stderr in some configurations
@@ -216,14 +243,10 @@ run_cc() {
     return "$exit_code"
   fi
 
-  # Parse all fields in one python3 call
-  local session_id="" result_text="" stop_reason="" num_turns=""
+  # Parse result in one python3 call — also detect permission denials
   eval "$(python3 -c "
-import json, sys
+import json, sys, os
 d = json.load(sys.stdin)
-# Shell-safe quoting via repr would be complex; use simple approach
-# Write to separate files instead
-import os
 base = sys.argv[1]
 sid = d.get('session_id', '')
 if sid:
@@ -233,11 +256,17 @@ if result:
     open(os.path.join(base, 'last-result.txt'), 'w').write(result)
 sr = d.get('stop_reason', '')
 nt = d.get('num_turns', 0)
-print(f'stop_reason={sr!r}; num_turns={nt!r}; session_id={sid!r}')
+denials = d.get('permission_denials', [])
+blocked = 'true' if denials else 'false'
+print('stop_reason=%s; num_turns=%s; session_id=%s; was_blocked=%s' % (repr(sr), repr(nt), repr(sid), blocked))
 " "$project_dir/.dispatch-logs" < "$log_file" 2>/dev/null)" || true
 
-  [[ -n "$session_id" ]] && log "Session ID saved: $session_id"
+  [[ -n "${session_id:-}" ]] && log "Session ID saved: $session_id"
   log "Stop reason: ${stop_reason:-?} | Turns: ${num_turns:-?}"
+
+  if [[ "${was_blocked:-false}" == "true" ]]; then
+    log "WARNING: Run had permission denials — some actions were blocked. Set DISPATCH_PERMISSION=dangerously-skip-permissions for fully autonomous execution."
+  fi
 
   cat "$log_file"
   log "Done. Log: $log_file"
@@ -260,8 +289,10 @@ parse_common_opts() {
   while [[ $# -gt 0 ]]; do
     case $1 in
       --slug|--prompt|--prompt-file|--desc|--timeout|--max-turns|--model|--allowed-tools|--system-prompt)
-        [[ $# -lt 2 ]] && die "$1 requires a value"
-        ;;&
+        if [[ $# -lt 2 ]]; then die "$1 requires a value"; fi
+        ;;
+    esac
+    case $1 in
       --slug)           _OPT_slug="$2"; shift 2 ;;
       --prompt)         _OPT_prompt="$2"; shift 2 ;;
       --prompt-file)    _OPT_prompt_file="$2"; shift 2 ;;
@@ -285,12 +316,16 @@ parse_common_opts() {
 
 cmd_run() {
   require_cc
+  require_timeout
   parse_common_opts "$@"
   [[ -z "$_OPT_slug" ]] && die "--slug is required"
   validate_slug "$_OPT_slug"
   [[ -z "$_OPT_prompt" && -z "$_OPT_prompt_file" ]] && die "--prompt or --prompt-file required"
 
-  [[ -n "$_OPT_prompt_file" ]] && _OPT_prompt=$(cat "$_OPT_prompt_file")
+  if [[ -n "$_OPT_prompt_file" ]]; then
+    [[ -f "$_OPT_prompt_file" ]] || die "Prompt file not found: $_OPT_prompt_file"
+    _OPT_prompt=$(cat "$_OPT_prompt_file")
+  fi
 
   local project_dir="$PROJECTS_DIR/$_OPT_slug"
   mkdir -p "$project_dir"
@@ -311,7 +346,9 @@ cmd_run() {
   fi
   created_at="${created_at:-$(date -Is)}"
   local desc="${_OPT_desc:-$old_desc}"
-  [[ -z "$desc" ]] && desc="${_OPT_prompt:0:100}"
+  if [[ -z "$desc" ]]; then
+    desc="${_OPT_prompt:0:100}"
+  fi
   python3 -c "
 import json, sys
 d = {'slug': sys.argv[1], 'description': sys.argv[2], 'created': sys.argv[3], 'updated': sys.argv[4]}
@@ -328,6 +365,7 @@ json.dump(d, open(sys.argv[5], 'w'), indent=2)
 
 cmd_review() {
   require_cc
+  require_timeout
   parse_common_opts "$@"
   [[ -z "$_OPT_slug" ]] && die "--slug is required"
   validate_slug "$_OPT_slug"
@@ -349,12 +387,15 @@ cmd_review() {
 
 cmd_resume() {
   require_cc
+  require_timeout
   parse_common_opts "$@"
   [[ -z "$_OPT_slug" ]] && die "--slug is required"
   validate_slug "$_OPT_slug"
   [[ -z "$_OPT_prompt" && -z "$_OPT_prompt_file" ]] && die "--prompt or --prompt-file required"
 
-  [[ -n "$_OPT_prompt_file" ]] && _OPT_prompt=$(cat "$_OPT_prompt_file")
+  if [[ -n "$_OPT_prompt_file" ]]; then
+    _OPT_prompt=$(cat "$_OPT_prompt_file")
+  fi
 
   local project_dir="$PROJECTS_DIR/$_OPT_slug"
   [[ -d "$project_dir" ]] || die "Project not found: $project_dir"
@@ -378,7 +419,10 @@ cmd_resume() {
 cmd_status() {
   local slug=""
   while [[ $# -gt 0 ]]; do
-    case $1 in --slug) slug="$2"; shift 2 ;; *) die "Unknown option: $1" ;; esac
+    case $1 in
+      --slug) slug="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
   done
   [[ -z "$slug" ]] && die "--slug is required"
   validate_slug "$slug"
@@ -397,10 +441,19 @@ cmd_status() {
     python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print(f\"  Status: {'success' if not d.get('is_error') else 'error'}\")
-print(f\"  Duration: {d.get('duration_ms', 0) / 1000:.1f}s\")
-print(f\"  Turns: {d.get('num_turns', 0)}\")
-print(f\"  Stop reason: {d.get('stop_reason', 'unknown')}\")
+denials = d.get('permission_denials', [])
+if denials:
+    status = 'BLOCKED (permission denials)'
+elif d.get('is_error'):
+    status = 'error'
+else:
+    status = 'success'
+print(f'  Status: {status}')
+print(f'  Duration: {d.get(\"duration_ms\", 0) / 1000:.1f}s')
+print(f'  Turns: {d.get(\"num_turns\", 0)}')
+print(f'  Stop reason: {d.get(\"stop_reason\", \"unknown\")}')
+if denials:
+    print(f'  Denials: {len(denials)} action(s) were blocked by permission policy')
 " < "$last_log" 2>/dev/null || echo "  (could not parse)"
   else
     echo "No runs yet"
@@ -418,19 +471,29 @@ cmd_list() {
   for dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$dir" ]] || continue
     count=$((count + 1))
-    local name; name=$(basename "$dir")
+    local name
+    name=$(basename "$dir")
     local desc=""
-    [[ -f "$dir/.dispatch-logs/project.json" ]] && desc=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('description','')[:80])" < "$dir/.dispatch-logs/project.json" 2>/dev/null || echo "")
+    if [[ -f "$dir/.dispatch-logs/project.json" ]]; then
+      desc=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('description','')[:80])" < "$dir/.dispatch-logs/project.json" 2>/dev/null || echo "")
+    fi
     local last=""
-    local last_log; last_log=$(ls -t "$dir/.dispatch-logs/"*-result.json 2>/dev/null | head -1 || echo "")
-    [[ -n "$last_log" ]] && last=$(file_mtime "$last_log")
+    local last_log
+    last_log=$(ls -t "$dir/.dispatch-logs/"*-result.json 2>/dev/null | head -1 || echo "")
+    if [[ -n "$last_log" ]]; then
+      last=$(file_mtime "$last_log")
+    fi
     if [[ -n "$desc" ]]; then
       printf "  %-25s %s  — %s\n" "$name" "${last:-(new)}" "$desc"
     else
       printf "  %-25s %s\n" "$name" "${last:-(new)}"
     fi
   done
-  [[ $count -eq 0 ]] && echo "No projects yet." || echo "  ($count projects)"
+  if [[ $count -eq 0 ]]; then
+    echo "No projects yet."
+  else
+    echo "  ($count projects)"
+  fi
 }
 
 cmd_search() {
@@ -443,19 +506,28 @@ cmd_search() {
   local found=0
   for dir in "$PROJECTS_DIR"/*/; do
     [[ -d "$dir" ]] || continue
-    local name; name=$(basename "$dir")
+    local name
+    name=$(basename "$dir")
     local desc=""
-    [[ -f "$dir/.dispatch-logs/project.json" ]] && desc=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('description',''))" < "$dir/.dispatch-logs/project.json" 2>/dev/null || echo "")
+    if [[ -f "$dir/.dispatch-logs/project.json" ]]; then
+      desc=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('description',''))" < "$dir/.dispatch-logs/project.json" 2>/dev/null || echo "")
+    fi
     local last_result=""
-    [[ -f "$dir/.dispatch-logs/last-result.txt" ]] && last_result=$(cat "$dir/.dispatch-logs/last-result.txt" 2>/dev/null || echo "")
-    local haystack; haystack=$(echo "$name $desc $last_result" | tr '[:upper:]' '[:lower:]')
-    local needle; needle=$(echo "$query" | tr '[:upper:]' '[:lower:]')
-    if [[ "$haystack" == *"$needle"* ]]; then
+    if [[ -f "$dir/.dispatch-logs/last-result.txt" ]]; then
+      last_result=$(cat "$dir/.dispatch-logs/last-result.txt" 2>/dev/null || echo "")
+    fi
+    local haystack
+    haystack=$(echo "$name $desc $last_result" | tr '[:upper:]' '[:lower:]')
+    local needle
+    needle=$(echo "$query" | tr '[:upper:]' '[:lower:]')
+    if echo "$haystack" | grep -q "$needle" 2>/dev/null; then
       found=$((found + 1))
       printf "  %-25s — %s\n" "$name" "${desc:-(no description)}"
     fi
   done
-  [[ $found -eq 0 ]] && echo "No projects matching '$query'."
+  if [[ $found -eq 0 ]]; then
+    echo "No projects matching '$query'."
+  fi
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────

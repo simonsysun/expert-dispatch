@@ -23,9 +23,10 @@ Your assistant is the **secretary**. The specialist is the **expert consultant**
 
 ## Prerequisites
 
-- **bash** 4+ (default on Linux; macOS may need `brew install bash`)
+- **bash** 3.2+ (macOS default works; Linux default works)
 - **python3** (for JSON parsing)
 - **Claude Code CLI** installed and authenticated ([install guide](https://claude.ai/claude-code))
+- **timeout** or **gtimeout** — included on Linux; on macOS: `brew install coreutils`
 - `~/.local/bin` in your `$PATH` (or install wherever you prefer)
 
 ## Quick Start
@@ -110,21 +111,31 @@ dispatch-cc review --slug my-api
 | `DISPATCH_PROJECTS_DIR` | `~/dispatch-projects` | Where project directories are created |
 | `DISPATCH_CC_BIN` | auto-detect | Path to `claude` CLI |
 | `DISPATCH_TIMEOUT` | `600` | Default timeout in seconds |
-| `DISPATCH_PERMISSION` | *(not set)* | Permission mode (see Security below) |
+| `DISPATCH_PERMISSION` | `acceptEdits` | Permission mode (see Permissions below) |
 
-## Security
+## Permissions and Security
 
-By default, Claude Code runs in its **normal interactive permission mode** — it will prompt for confirmation before executing commands or writing files. This is the safe default.
+Claude Code in headless mode (`-p`) needs a permission policy that doesn't require interactive approval. The adapter defaults to `acceptEdits`, which auto-approves file reads and writes but still logs all actions.
 
-For fully autonomous execution (e.g., in trusted environments or sandboxes), you can set:
+**Permission modes:**
 
+| Mode | What it auto-approves | Best for |
+|------|----------------------|----------|
+| `acceptEdits` (default) | File reads/writes | Most use cases — CC can create/edit files |
+| `plan` | Nothing — read-only analysis | Review, auditing, research tasks |
+| `dangerously-skip-permissions` | Everything including shell commands | Trusted/sandboxed environments only |
+
+To change:
 ```bash
-export DISPATCH_PERMISSION="dangerously-skip-permissions"
+export DISPATCH_PERMISSION="dangerously-skip-permissions"  # fully autonomous
+export DISPATCH_PERMISSION="plan"                          # read-only
 ```
 
-> **Warning:** This skips all permission checks. Only use this in environments where you trust the input and the execution context. See [Claude Code permission docs](https://code.claude.com/docs/en/permissions) for details.
+> **Warning:** `dangerously-skip-permissions` skips ALL permission checks including shell execution. Only use in environments where you trust the input. See [Claude Code permission docs](https://code.claude.com/docs/en/permissions).
 
-Other available modes: `acceptEdits`, `plan`, `auto` (requires Team/Enterprise).
+**What happens when permissions block an action:** The adapter detects `permission_denials` in CC's output and reports the run as BLOCKED (visible in `dispatch-cc status`), so you know the task didn't fully complete.
+
+**Data flow:** Prompts and code are sent to Anthropic's API for processing. The adapter itself does not handle provider credentials, but Claude Code can read files in the project working directory. Review [Claude Code's data usage policy](https://docs.anthropic.com/en/docs/claude-code/data-usage) for details.
 
 ## How It Works
 
@@ -176,8 +187,8 @@ rm ~/.local/bin/dispatch-cc           # uninstall
 ## Important Notes
 
 - **Provider terms**: Users are responsible for ensuring their use complies with the terms of service of their chosen specialist backend.
-- **Privacy**: Prompts and outputs are sent to the specialist provider's API. Review their data handling policies.
-- **Credentials**: This tool never reads, copies, or exposes authentication credentials.
+- **Privacy**: Prompts and code are sent to the specialist provider's API for processing. Review their data handling policies.
+- **Credentials**: The adapter does not directly handle provider credentials. It invokes the specialist CLI, which manages its own authentication.
 
 ## License
 
