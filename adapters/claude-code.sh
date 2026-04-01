@@ -20,7 +20,7 @@ set -euo pipefail
 #                            prompt interactively. "acceptEdits" auto-approves file edits;
 #                            "dangerously-skip-permissions" auto-approves everything.
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly PROJECTS_DIR="${DISPATCH_PROJECTS_DIR:-$HOME/dispatch-projects}"
 readonly DEFAULT_TIMEOUT="${DISPATCH_TIMEOUT:-600}"
 readonly DEFAULT_MAX_TURNS=0
@@ -344,7 +344,7 @@ cmd_run() {
     created_at=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('created',''))" < "$meta_file" 2>/dev/null || echo "")
     old_desc=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('description',''))" < "$meta_file" 2>/dev/null || echo "")
   fi
-  created_at="${created_at:-$(date -Is)}"
+  created_at="${created_at:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
   local desc="${_OPT_desc:-$old_desc}"
   if [[ -z "$desc" ]]; then
     desc="${_OPT_prompt:0:100}"
@@ -353,7 +353,7 @@ cmd_run() {
 import json, sys
 d = {'slug': sys.argv[1], 'description': sys.argv[2], 'created': sys.argv[3], 'updated': sys.argv[4]}
 json.dump(d, open(sys.argv[5], 'w'), indent=2)
-" "$_OPT_slug" "$desc" "$created_at" "$(date -Is)" "$meta_file" 2>/dev/null
+" "$_OPT_slug" "$desc" "$created_at" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$meta_file" 2>/dev/null
 
   local lock_dir
   lock_dir=$(lock_dir_for_slug "$_OPT_slug")
@@ -520,7 +520,7 @@ cmd_search() {
     haystack=$(echo "$name $desc $last_result" | tr '[:upper:]' '[:lower:]')
     local needle
     needle=$(echo "$query" | tr '[:upper:]' '[:lower:]')
-    if echo "$haystack" | grep -q "$needle" 2>/dev/null; then
+    if echo "$haystack" | grep -Fqi "$needle" 2>/dev/null; then
       found=$((found + 1))
       printf "  %-25s — %s\n" "$name" "${desc:-(no description)}"
     fi

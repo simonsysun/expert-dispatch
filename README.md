@@ -6,7 +6,7 @@ Delegate complex tasks from your AI assistant to specialist backends like Claude
 
 Most AI assistants use one model for everything. That's wasteful: routine tasks don't need a top-tier model, but complex tasks do.
 
-**expert-dispatch** implements the **Outsourced Expert Pattern**: your main assistant handles daily work with a cheap model. When it encounters something that needs depth — coding, analysis, research — it dispatches to a specialist that runs locally.
+**expert-dispatch** implements the **Specialist Dispatch Pattern**: your main assistant handles daily work with a cheap model. When it encounters something that needs depth — coding, analysis, research — it dispatches to a specialist that runs locally.
 
 ```
 User (chat interface)
