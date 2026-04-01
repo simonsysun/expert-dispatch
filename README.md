@@ -1,10 +1,18 @@
 # expert-dispatch
 
-Delegate complex tasks from your AI assistant to specialist backends like Claude Code, keeping your main agent cheap and your specialist work high-quality.
+**Why pay for your best model on every turn?** Most assistant work is email, calendar, and quick lookups — a $0.30/M-token model handles that fine. But when you need real coding, deep analysis, or expert-level writing, you want the strongest model available.
+
+**expert-dispatch** bridges that gap: your cheap main assistant stays in "secretary mode" most of the time, and calls Claude Code (or any specialist CLI) only when the task genuinely needs it. One shell command. Structured output. Session continuity. Audit trail.
+
+```
+User: "Build me a REST API for task management"
+  → Assistant (cheap model): "This needs specialist work. Dispatching to Claude Code..."
+    → dispatch-cc run --slug task-api --prompt "Create a Flask REST API with CRUD..."
+    → Claude Code works autonomously, creates files, runs tests
+  → Assistant: "Done. CC created 4 files, all tests pass. Here's what was built: ..."
+```
 
 ## The Pattern
-
-Most AI assistants use one model for everything. That's wasteful: routine tasks don't need a top-tier model, but complex tasks do.
 
 **expert-dispatch** implements the **Specialist Dispatch Pattern**: your main assistant handles daily work with a cheap model. When it encounters something that needs depth — coding, analysis, research — it dispatches to a specialist that runs locally.
 
